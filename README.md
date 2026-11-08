@@ -1,6 +1,46 @@
 # Reusable DevSecOps workflows
 
-This repository is a GitHub Actions catalog for .NET applications. It builds and scans containers on ephemeral ARC runners, signs releases, and promotes verified image digests into a GitOps repository. Argo CD handles Kubernetes deployment. No workflow receives a kubeconfig or Argo CD administrator token.
+`gha-workflows` is a reusable GitHub Actions catalog for .NET application delivery. It checks source code, builds and scans one container candidate, publishes and signs its immutable digest, and updates a separate GitOps repository. Argo CD reconciles that desired state into Kubernetes; CD can observe reconciliation and check the deployed application. No workflow receives a kubeconfig or Argo CD administrator token.
+
+This repository contains delivery automation. The companion .NET sample supplies the application, Dockerfile, caller workflow, Kustomize manifests, and local k3d/ARC/Argo CD setup. Its Gitea service hosts GitOps, not GitHub Actions execution. The catalog does not provision those services or cloud infrastructure.
+
+## Documentation
+
+| Guide | Contents |
+| --- | --- |
+| [Project overview](docs/PROJECT_OVERVIEW.md) | Scope, components, delivery walkthrough, and consumer responsibilities |
+| [Architecture](docs/architecture.md) | Execution model, candidate identity, trust boundaries, credentials, and networking |
+| [Pipelines](docs/pipelines.md) | Job dependencies, event/runner policy, gates, outputs, evidence, and troubleshooting |
+| [GitOps](docs/gitops.md) | Target preparation, digest promotion, exact deployment validation, approvals, and guarded recovery |
+| [Roadmap](docs/ROADMAP.md) | Implemented baseline, installation-specific rollout checks, and proposed extensions |
+
+This README holds the detailed action and consumer contracts. Workflow and action source remains authoritative.
+
+## Getting started
+
+1. Prepare the application project or solution, committed NuGet lock files, and explicit test projects. Supply `publish-project` when building a solution.
+2. Provide a Dockerfile for one target platform, a root `version.json`, full Git history, and a registry/image repository. Stable and RC tags must match the committed version manifest.
+3. Configure caller events and permissions, approved ARC runner capacity, and hosted runners for designated jobs. Protect main and release tags; keep untrusted PR execution away from privileged runners.
+4. Call [reusable CI](.github/workflows/dotnet-ci.yml). Before production, use an immutable catalog commit for both the workflow reference and `catalog-ref`, and configure the exact signing identity in CI and CD. Composite actions require the complete catalog checkout at `.catalog`.
+5. Prepare an existing GitOps branch and unique Kustomize image entry, scoped write credentials, an Argo CD single-source Application, and a protected GitHub environment. Provision private-registry pull credentials separately in Kubernetes.
+6. Call [reusable CD](.github/workflows/dotnet-cd.yml) after CI returns a non-empty `image`. Pass that digest unchanged, the full `github.sha` as `source-revision`, and `github.ref` as `source-ref`, using the same registry/image binding.
+7. Enable deployment validation with reachable Argo/application endpoints, a scoped read-only Argo token, and trusted CAs where needed. The default is promotion-only and returns `validated: false`.
+
+See [pipelines](docs/pipelines.md) for caller configuration and [GitOps target preparation](docs/gitops.md#prepare-the-target) for deployment prerequisites. Selecting an environment does not create its overlay, Argo Application, endpoint, or approval rules.
+
+## Delivery flow
+
+| Phase | What must happen |
+| --- | --- |
+| Source validation | Quality, Gitleaks, Semgrep, source Trivy, Checkov, and CodeQL run independently; all six must succeed before build/test |
+| Application validation | Release build, configured unit/E2E tests, published-output Trivy/Grype checks, and every enabled integration gate |
+| Candidate validation | Build one platform without pushing; reload the exact archive for image scans and CycloneDX/SPDX inventories |
+| Release | Central gate succeeds; eligible pushes publish without rebuilding, verify remote identity, sign, attest, and create provenance |
+| Promotion | CD verifies digest/source/signer claims, obtains configured approval, re-verifies, rejects stale source, and commits one image entry |
+| Deployed validation | When enabled, observe the exact GitOps revision/image, Synced and Healthy state, HTTP smoke, and every enabled k6/ZAP check |
+| Recovery | Opt-in guarded restoration creates a new Git commit and validates recovery; the original candidate remains failed and unvalidated |
+
+Archive SHA-256, Docker image ID/config digest, and registry manifest digest serve different identity checks. CD receives the immutable registry digest, never a mutable version alias. See [architecture](docs/architecture.md#candidate-identity-across-jobs) for that handoff.
 
 ## Repository layout
 
@@ -29,9 +69,9 @@ Call `mehdihadeli/gha-workflows/.github/workflows/dotnet-ci.yml@main` from an ap
 
 `test-project` and `e2e-test-project` require committed dependency lock files. Empty inputs mean no corresponding suite is configured, not passing tests. Set `require-tests: true` to reject that state. A configured suite must produce nonzero TRX test counters. `test-platform` and `e2e-test-platform` support `vstest`, `mtp`, and `mtp-bridge`; native MTP requires SDK 10+ and the repository's MTP runner configuration in `global.json`. MTP projects need the TRX reporting extension. `collect-coverage` uses VSTest's XPlat collector and produces OpenCover/Cobertura; install the collector in the consumer test project. MTP coverage is not silently substituted with VSTest flags.
 
-The caller must grant `contents: read`, `actions: read`, `security-events: write`, `packages: write`, `id-token: write`, and `attestations: write`. Jobs reduce permissions to what they need. CodeQL runs on GitHub-hosted runners and requires a public repository or the applicable GitHub Code Security entitlement for private repositories.
+The caller must grant `contents: read`, `actions: read`, `pull-requests: read`, `security-events: write`, `packages: write`, `id-token: write`, and `attestations: write`. Jobs reduce permissions to what they need. CodeQL runs on GitHub-hosted runners and requires a public repository or the applicable GitHub Code Security entitlement for private repositories.
 
-Pull requests and manual dispatches use hosted runners and never publish or promote. Main-branch CI pushes use `arc-devsecops`; tag CI uses hosted runners. Eligible main, stable-tag, and RC-tag pushes publish only after the security gate succeeds. Do not introduce `pull_request_target` execution of untrusted code on these runners. Limit the ARC runner group to approved repositories/workflows and protect both `main` and release tags.
+Pull requests and manual dispatches use hosted candidate runners and never publish or promote. Most main-push candidate jobs use the configured runner, defaulting to `arc-devsecops`; tag candidate jobs use hosted runners. CodeQL, version calculation, central gates, and the scorecard remain hosted. The eligible release job always uses the configured runner, including stable and RC tags. CD deployment operations also need configured runners that can reach GitOps, the registry, Argo CD, and application endpoints. Eligible main, stable-tag, and RC-tag pushes publish only after the security gate succeeds. Do not introduce `pull_request_target` execution of untrusted code on these runners. Limit the ARC runner group to approved repositories/workflows and protect both `main` and release tags.
 
 ### Release versioning
 
@@ -138,7 +178,7 @@ Set reusable CI input `sbom-generator: syft` to select Syft for the image invent
 
 ## GitOps contract
 
-The CI workflow exposes `image` as `<registry>/<image-name>@sha256:<digest>`, defaulting to `ghcr.io/<application-repository>@sha256:<digest>`. Call `mehdihadeli/gha-workflows/.github/workflows/dotnet-cd.yml@main` in a dependent job from the same application run. Supply `image`, `source-revision`, `source-ref: ${{ github.ref }}`, `repo-url`, `username`, and the `gitops-token` secret. When overriding the registry or image name, pass the same values and registry read credentials to CD. Both templates own their jobs directly; no intermediate reusable workflow is required.
+The CI workflow exposes `image` as `<registry>/<image-name>@sha256:<digest>`, defaulting to `ghcr.io/<application-repository>@sha256:<digest>`, only after an eligible release completes. Call `mehdihadeli/gha-workflows/.github/workflows/dotnet-cd.yml@main` in a dependent job from the same application run when that output is non-empty. Supply `image`, `source-revision: ${{ github.sha }}`, `source-ref: ${{ github.ref }}`, `repo-url`, `username`, and the `gitops-token` secret. CI's short `commit` output is display metadata, not a substitute for the full source SHA. When overriding the registry or image name, pass the same values and registry read credentials to CD. Both templates own their jobs directly; no intermediate reusable workflow is required.
 
 Promotion verifies the exact certificate identity and GitHub OIDC issuer, checks signed GitHub certificate claims for the caller repository, commit, source ref, and push event, and verifies the CycloneDX attestation. Only main and strict stable/RC refs are accepted; image references must match the configured registry/image repository exactly. Promotion resolves the actual source branch or tag through GitHub's commits API and skips the build if that ref no longer points to its source commit. It updates exactly one existing image entry, removes its mutable tag, and commits its digest. The GitOps bot needs repository write access, not cluster access. Concurrent GitOps writers cause a normal non-fast-forward failure; rerun after review rather than force-pushing.
 
@@ -199,13 +239,15 @@ Disabled tools are explicit configuration states. Enabled integrations with miss
 
 The supplied .NET CI/CD attachments and [DevSecOps platform template](https://github.com/abhishekpanda0620/devsecops-platform-template) informed stage ordering, separate source/application/image scans, explicit gates, evidence, and environment promotion. Its [architecture](https://github.com/abhishekpanda0620/devsecops-platform-template/blob/main/docs/architecture.md), [GitOps](https://github.com/abhishekpanda0620/devsecops-platform-template/blob/main/docs/gitops.md), [pipeline](https://github.com/abhishekpanda0620/devsecops-platform-template/blob/main/docs/pipelines.md), and [security](https://github.com/abhishekpanda0620/devsecops-platform-template/blob/main/docs/security.md) documents were reviewed. This implementation keeps Argo CD/k3d/ARC, not direct Azure/Flux deployment, simulated waits, wildcard signer identities, or simulated rollback.
 
-License/EOL enforcement, authenticated DAST, cluster admission verification, monitoring, and multi-source Argo applications are not claimed by these workflows. GitHub provenance is evidence, not a claim of SLSA certification. Scanner rules/databases remain updateable even when scanner binaries are version-pinned.
+License/EOL enforcement, authenticated DAST, cluster admission verification, monitoring, scheduled rescanning, multi-platform publication, and multi-source Argo applications are not implemented by these workflows. GitHub provenance is evidence, not a claim of SLSA certification. Scanner rules/databases remain updateable even when scanner binaries are version-pinned.
+
+Implemented automation is not proof of a completed production rollout. Before production use, capture live preview/RC/stable release evidence, registry candidate/digest checks, OIDC signatures and attestations, exact Argo reconciliation, approval enforcement, runner restrictions, and guarded recovery. Exercise rejection paths for stale source, wrong identity/source/repository, failed or unexpectedly skipped gates, and concurrent GitOps writes. Local regressions and mocks cannot establish those installation-specific results. The [roadmap](docs/ROADMAP.md#priority-1-publish-and-validate-the-existing-path) separates these rollout checks from proposed features.
 
 Run focused version regressions with `python3 -m unittest discover -s .github/actions/calculate-version -p 'test_*.py' -v` and reconciliation regressions with `python3 -m unittest discover -s .github/actions/argocd-wait -p test_wait.py -v`.
 
 Run guarded rollback regressions with `python3 -m unittest discover -s .github/actions/promote-gitops -p test_rollback.py -v`. They use real temporary Git repositories with isolated registry-tool mocks; they do not push to the configured deployment repository.
 
-## Documentation
+## External references
 
 - [GitHub reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
 - [ARC getting started](https://docs.github.com/en/actions/tutorials/use-actions-runner-controller/get-started)
